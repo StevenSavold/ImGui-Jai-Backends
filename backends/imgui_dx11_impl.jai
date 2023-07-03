@@ -422,6 +422,7 @@ ImGui_ImplDX11_Init :: (device: *ID3D11Device, device_context: *ID3D11DeviceCont
     io.BackendRendererUserData = cast(*void)bd;
     io.BackendRendererName = "imgui_impl_dx11_jai";
     io.BackendFlags_ |= .ImGuiBackendFlags_RendererHasVtxOffset; // We honor the ImDrawCmd::VtxOffset field, allowing for large meshes.
+    io.BackendFlags_ |= .ImGuiBackendFlags_RendererHasViewports; // We can create mutli-viewports on the Renderer side (optional)
 
     // Get factory from device
     pDXGIDevice: *IDXGIDevice;
@@ -442,6 +443,9 @@ ImGui_ImplDX11_Init :: (device: *ID3D11Device, device_context: *ID3D11DeviceCont
     IUnknown_AddRef(bd.pd3dDevice);
     IUnknown_AddRef(bd.pd3dDeviceContext);
 
+    if io.ConfigFlags_ & .ImGuiConfigFlags_ViewportsEnable
+        ImGui_ImplDX11_InitPlatformInterface();
+
     return true;
 }
 
@@ -450,15 +454,19 @@ ImGui_ImplDX11_Shutdown :: () {
     assert(bd != null, "No renderer backend to shutdown, or already shutdown?");
     io := ImGui.GetIO();
 
+    ImGui_ImplDX11_ShutdownPlatformInterface();
     ImGui_ImplDX11_InvalidateDeviceObjects();
     if (bd.pFactory)           IUnknown_Release(bd.pFactory);
     if (bd.pd3dDevice)         IUnknown_Release(bd.pd3dDevice);
     if (bd.pd3dDeviceContext)  IUnknown_Release(bd.pd3dDeviceContext);
     io.BackendRendererName = null;
     io.BackendRendererUserData = null;
-    io.BackendFlags_ &= ~.ImGuiBackendFlags_RendererHasVtxOffset;
+    io.BackendFlags_ &= ~(.ImGuiBackendFlags_RendererHasVtxOffset | .ImGuiBackendFlags_RendererHasViewports);
 
-    free(bd);
+    if bd {
+        free(bd);
+        bd = null;
+    }
 }
 
 ImGui_ImplDX11_NewFrame :: () {
@@ -471,7 +479,7 @@ ImGui_ImplDX11_NewFrame :: () {
 
 
 #scope_file
-ImGui_ImplDX11_GetBackendData :: () -> *ImGui_ImplDX11_Data {
+ImGui_ImplDX11_GetBackendData :: () -> *ImGui_ImplDX11_Data #c_call {
     return ifx ImGui.GetCurrentContext() then ImGui.GetIO().BackendRendererUserData else null;
 }
 
@@ -485,6 +493,8 @@ ImGui_ImplDX11_SetupRenderState :: (draw_data: *ImGui.ImDrawData, ctx: *ID3D11De
         Height = draw_data.DisplaySize.y;
         MinDepth = 0.0;
         MaxDepth = 1.0;
+        vp.TopLeftX = 0;
+        vp.TopLeftY = 0;
         ID3D11DeviceContext_RSSetViewports(ctx, 1, *vp);
     }
 
@@ -572,6 +582,130 @@ ImGui_ImplDX11_CreateFontsTexture :: () {
         MaxLOD = 0.0;
         ID3D11Device_CreateSamplerState(bd.pd3dDevice, *desc, *bd.pFontSampler);
     }
+}
+
+
+// Multi-Viewport stuff
+ImGui_ImplDX11_ViewportData :: struct {
+    SwapChain: *IDXGISwapChain;
+    RTView: *ID3D11RenderTargetView;
+}
+
+ImGui_ImplDX11_CreateWindow :: (viewport: *ImGui.Viewport) #c_call {
+    ctx: Context;
+    push_context ctx {
+        bd := ImGui_ImplDX11_GetBackendData();
+        vd := cast(*ImGui_ImplDX11_ViewportData)alloc(size_of(ImGui_ImplDX11_ViewportData));
+        memset(vd, 0, size_of(ImGui_ImplDX11_ViewportData)); // clear the memory at the allocated location? why does this seem not to already be cleared by alloc?
+        viewport.RendererUserData = vd;
+
+        // PlatformHandleRaw should always be a HWND, whereas PlatformHandle might be a higher-level handle (e.g. GLFWWindow*, SDL_Window*).
+        // Some backends will leave PlatformHandleRaw == 0, in which case we assume PlatformHandle will contain the HWND.
+        hwnd: HWND = ifx viewport.PlatformHandleRaw then cast(HWND)viewport.PlatformHandleRaw else cast(HWND)viewport.PlatformHandle;
+        assert(hwnd != null);
+
+        // Create swap chain
+        using sd: DXGI_SWAP_CHAIN_DESC;
+        BufferDesc.Width   = cast(u32)viewport.Size.x;
+        BufferDesc.Height  = cast(u32)viewport.Size.y;
+        BufferDesc.Format  = .DXGI_FORMAT_R8G8B8A8_UNORM;
+        SampleDesc.Count   = 1;
+        SampleDesc.Quality = 0;
+        BufferUsage        = .DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        BufferCount        = 1;
+        OutputWindow       = hwnd;
+        Windowed           = 1; // True
+        SwapEffect         = .DXGI_SWAP_EFFECT_DISCARD;
+        Flags              = 0;
+
+        assert(vd.SwapChain == null && vd.RTView == null);
+        IDXGIFactory_CreateSwapChain(bd.pFactory, bd.pd3dDevice, *sd, *vd.SwapChain);
+
+        // Create the render target
+        if vd.SwapChain {
+            pBackBuffer: *ID3D11Texture2D;
+            IDXGISwapChain_GetBuffer(vd.SwapChain, 0, *uid(ID3D11Texture2D_UUID), cast(**void)*pBackBuffer);
+            ID3D11Device_CreateRenderTargetView(bd.pd3dDevice, pBackBuffer, null, *vd.RTView);
+            IUnknown_Release(pBackBuffer);
+        }
+    }
+}
+
+ImGui_ImplDX11_DestroyWindow :: (viewport: *ImGui.Viewport) #c_call {
+    ctx: Context;
+    push_context ctx {
+        // The main viewport (owned by the application) will always have RendererUserData == nullptr since we didn't create the data for it.
+        vd := cast(*ImGui_ImplDX11_ViewportData)viewport.RendererUserData;
+        if vd {
+            if vd.SwapChain
+                IUnknown_Release(vd.SwapChain);
+            vd.SwapChain = null;
+
+            if vd.RTView
+                IUnknown_Release(vd.RTView);
+            vd.RTView = null;
+
+            free(vd);
+        }
+        viewport.RendererUserData = null;
+    }
+}
+
+ImGui_ImplDX11_SetWindowSize :: (viewport: *ImGui.Viewport, size: ImGui.ImVec2) #c_call {
+    ctx: Context;
+    push_context ctx {
+        bd := ImGui_ImplDX11_GetBackendData();
+        vd := cast(*ImGui_ImplDX11_ViewportData)viewport.RendererUserData;
+        if vd.RTView {
+            IUnknown_Release(vd.RTView);
+            vd.RTView = null;
+        }
+        if vd.SwapChain {
+            pBackBuffer: *ID3D11Texture2D;
+            IDXGISwapChain_ResizeBuffers(vd.SwapChain, 0, cast(u32)size.x, cast(u32)size.y, .DXGI_FORMAT_UNKNOWN, 0);
+            IDXGISwapChain_GetBuffer(vd.SwapChain, 0, *uid(ID3D11Texture2D_UUID), cast(**void)*pBackBuffer);
+            if pBackBuffer == null {
+                log_error("ImGui_ImplDX11_SetWindowSize() failed creating buffers.");
+                return;
+            }
+            ID3D11Device_CreateRenderTargetView(bd.pd3dDevice, pBackBuffer, null, *vd.RTView);
+            IUnknown_Release(pBackBuffer);
+        }
+    }
+}
+
+ImGui_ImplDX11_RenderWindow :: (viewport: *ImGui.Viewport, unused: *void) #c_call {
+    ctx: Context;
+    push_context ctx {
+        bd := ImGui_ImplDX11_GetBackendData();
+        vd := cast(*ImGui_ImplDX11_ViewportData)viewport.RendererUserData;
+        clear_color : [4] float = .[ 0.0, 0.0, 0.0, 1.0 ];
+        ID3D11DeviceContext_OMSetRenderTargets(bd.pd3dDeviceContext, 1, *vd.RTView, null);
+        if !(viewport.Flags & .ImGuiViewportFlags_NoRendererClear)
+            ID3D11DeviceContext_ClearRenderTargetView(bd.pd3dDeviceContext, vd.RTView, *clear_color);
+        ImGui_ImplDX11_RenderDrawData(viewport.DrawData);
+    }
+}
+
+ImGui_ImplDX11_SwapBuffers :: (viewport: *ImGui.Viewport, unused: *void) #c_call {
+    ctx: Context;
+    push_context ctx {
+        vd := cast(*ImGui_ImplDX11_ViewportData)viewport.RendererUserData;
+        IDXGISwapChain_Present(vd.SwapChain, 0, 0); // present without vsync
+    }
+}
+
+ImGui_ImplDX11_InitPlatformInterface :: () {
+    platform_io := ImGui.GetPlatformIO();
+    platform_io.Renderer_CreateWindow  = ImGui_ImplDX11_CreateWindow;
+    platform_io.Renderer_DestroyWindow = ImGui_ImplDX11_DestroyWindow;
+    platform_io.Renderer_SetWindowSize = ImGui_ImplDX11_SetWindowSize;
+    platform_io.Renderer_RenderWindow  = ImGui_ImplDX11_RenderWindow;
+    platform_io.Renderer_SwapBuffers   = ImGui_ImplDX11_SwapBuffers;
+}
+
+ImGui_ImplDX11_ShutdownPlatformInterface :: () {
+    ImGui.DestroyPlatformWindows();
 }
 
 // Custom Utility to get the offsets of a member
