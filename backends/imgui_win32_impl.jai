@@ -3,6 +3,11 @@
 // in Jai. It is mostly syntax changes, but there are a few things that needed to be 
 // changed to fit the Jai way of doing things.
 //
+// This file assumes that you have imported Jai's Gamepad module and called init_gamepad() 
+// and update_gamepad() at the appropriate times in your application code as dictated by 
+// that module. It might be better for us not to depend on that module and we might make 
+// that change in the future, but for now this is needed.
+//
 
 ImGui_ImplWin32_Data :: struct {
     hWnd: HWND;
@@ -14,7 +19,7 @@ ImGui_ImplWin32_Data :: struct {
     LastMouseCursor: ImGui.MouseCursor;
 
     HasGamepad: bool;
-    WantUpdateHasGamePad: bool;
+    WantUpdateHasGamepad: bool;
     // NOTE(Steven): Removed because Jai's Gamepad module brings these in for us
     // XInputDLL: HMODULE;
     // XInputGetCapabilities: PFN_XInputGetCapabilities;
@@ -234,7 +239,7 @@ ImGui_ImplWin32_WindowProc :: (hwnd: HWND, message: u32, wParam: WPARAM, lParam:
 
             case WM_DEVICECHANGE;
                 if wParam == DBT_DEVNODES_CHANGED
-                    bd.WantUpdateHasGamePad = true;
+                    bd.WantUpdateHasGamepad = true;
                 return 0;
         }
 
@@ -281,6 +286,7 @@ ImGui_ImplWin32_InitEx :: (hwnd: *void, platform_has_own_dc: bool) -> bool {
     // platform_has_own_dc is used in 'docking' branch.
 
     // Dynamically load XInput library
+    bd.WantUpdateHasGamepad = true;
     // NOTE(Steven): Removed because Jai's Gamepad module will load the functions for us.
 
     return true;
@@ -375,7 +381,67 @@ ImGui_ImplWin32_UpdateMouseData :: () {
 }
 
 ImGui_ImplWin32_UpdateGamepads :: () {
-    // TODO(Steven): Implement me! Found at line 298 of https://github.com/ocornut/imgui/blob/master/backends/imgui_impl_win32.cpp
+    io := ImGui.GetIO();
+    bd := ImGui_ImplWin32_GetBackendData();
+
+    // Calling XInputGetState() every frame on disconnected gamepads is unfortunately too slow.
+    // Instead we refresh gamepad availability by calling XInputGetCapabilities() _only_ after receiving WM_DEVICECHANGE.
+    if bd.WantUpdateHasGamepad {
+        state: XINPUT_STATE;
+        // NOTE(Steven): The original ImGui BAckend used XInputGetCapabilities(), but since we depend
+        // on the Jai Gamepad module, we will just leverage that it automatically pulls in XInputGetState() 
+        // for us and use that.
+        result := XInputGetState(0, *state);
+
+        ERROR_DEVICE_NOT_CONNECTED :: 1167; // From winerror.h
+        bd.HasGamepad = result != ERROR_DEVICE_NOT_CONNECTED;
+        bd.WantUpdateHasGamepad = false;
+    }
+
+    io.BackendFlags_ &= ~.ImGuiBackendFlags_HasGamepad;
+    xinput_state: XINPUT_STATE;
+    gamepad := *xinput_state.Gamepad;
+    if !bd.HasGamepad || XInputGetState(0, *xinput_state) != 0
+        return;
+    io.BackendFlags_ |= .ImGuiBackendFlags_HasGamepad;
+
+    MAP_BUTTON :: (KEY_NO: ImGui.Key, BUTTON_ENUM: s64) #expand { `io.AddKeyEvent(`io, KEY_NO, (`gamepad.wButtons & BUTTON_ENUM) != 0); }
+    MAP_ANALOG :: (KEY_NO: ImGui.Key, VALUE: s16, V0: s16, V1: s16) #expand { vn := cast(float32)(VALUE - V0) / cast(float32)(V1 - V0); `io.AddKeyAnalogEvent(`io, KEY_NO, vn > 0.10, saturate(vn)); }
+
+    MAP_BUTTON(.ImGuiKey_GamepadStart,     XINPUT_GAMEPAD_START);
+    MAP_BUTTON(.ImGuiKey_GamepadBack,      XINPUT_GAMEPAD_BACK);
+
+    MAP_BUTTON(.ImGuiKey_GamepadFaceLeft,  XINPUT_GAMEPAD_X);
+    MAP_BUTTON(.ImGuiKey_GamepadFaceRight, XINPUT_GAMEPAD_B);
+    MAP_BUTTON(.ImGuiKey_GamepadFaceUp,    XINPUT_GAMEPAD_Y);
+    MAP_BUTTON(.ImGuiKey_GamepadFaceDown,  XINPUT_GAMEPAD_A);
+
+    MAP_BUTTON(.ImGuiKey_GamepadDpadLeft,  XINPUT_GAMEPAD_DPAD_LEFT);
+    MAP_BUTTON(.ImGuiKey_GamepadDpadRight, XINPUT_GAMEPAD_DPAD_RIGHT);
+    MAP_BUTTON(.ImGuiKey_GamepadDpadUp,    XINPUT_GAMEPAD_DPAD_UP);
+    MAP_BUTTON(.ImGuiKey_GamepadDpadDown,  XINPUT_GAMEPAD_DPAD_DOWN);
+
+    MAP_BUTTON(.ImGuiKey_GamepadL1,        XINPUT_GAMEPAD_LEFT_SHOULDER);
+    MAP_BUTTON(.ImGuiKey_GamepadR1,        XINPUT_GAMEPAD_RIGHT_SHOULDER);
+
+    MAP_ANALOG(.ImGuiKey_GamepadL2,          gamepad.bLeftTrigger,   XINPUT_GAMEPAD_TRIGGER_THRESHOLD,    255);
+    MAP_ANALOG(.ImGuiKey_GamepadR2,          gamepad.bRightTrigger,  XINPUT_GAMEPAD_TRIGGER_THRESHOLD,    255);
+
+    MAP_BUTTON(.ImGuiKey_GamepadL3,        XINPUT_GAMEPAD_LEFT_THUMB);
+    MAP_BUTTON(.ImGuiKey_GamepadR3,        XINPUT_GAMEPAD_RIGHT_THUMB);
+
+    MAP_ANALOG(.ImGuiKey_GamepadLStickLeft,  gamepad.sThumbLX,      -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, -32768);
+    MAP_ANALOG(.ImGuiKey_GamepadLStickRight, gamepad.sThumbLX,      +XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, +32767);
+    MAP_ANALOG(.ImGuiKey_GamepadLStickUp,    gamepad.sThumbLY,      +XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, +32767);
+    MAP_ANALOG(.ImGuiKey_GamepadLStickDown,  gamepad.sThumbLY,      -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, -32768);
+
+    // NOTE(Steven): The original imgui backend file uses XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE for left and right stick
+    // inputs. Im not sure why this is... XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE does exist and is a slightly different
+    // value. So we have opted to use the behavior that ImGui implemented to try to keep this faithful to that backend.
+    MAP_ANALOG(.ImGuiKey_GamepadRStickLeft,  gamepad.sThumbRX,      -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, -32768);
+    MAP_ANALOG(.ImGuiKey_GamepadRStickRight, gamepad.sThumbRX,      +XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, +32767);
+    MAP_ANALOG(.ImGuiKey_GamepadRStickUp,    gamepad.sThumbRY,      +XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, +32767);
+    MAP_ANALOG(.ImGuiKey_GamepadRStickDown,  gamepad.sThumbRY,      -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, -32768);
 }
 
 GetMouseSourceFromMessageExtraInfo :: () -> ImGui.MouseSource {
