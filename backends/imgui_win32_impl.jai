@@ -272,7 +272,7 @@ ImGui_ImplWin32_EnableDpiAwareness :: () {
     if _IsWindows10OrGreater() {
         if !user32_dll
             user32_dll = LoadLibraryA("user32.dll"); // Reference counted per-process
-        SetThreadDpiAwarenessContext : (dpiContext: DPI_AWARENESS_CONTEXT) -> DPI_AWARENESS_CONTEXT #foreign = xx GetProcAddress(user32_dll, "SetThreadDpiAwarenessContext");
+        SetThreadDpiAwarenessContext : (dpiContext: DPI_AWARENESS_CONTEXT) -> DPI_AWARENESS_CONTEXT #c_call = xx GetProcAddress(user32_dll, "SetThreadDpiAwarenessContext");
 
         if SetThreadDpiAwarenessContext {
             SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -282,7 +282,7 @@ ImGui_ImplWin32_EnableDpiAwareness :: () {
     if _IsWindows8Point1OrGreater() {
         if !shcore_dll
             shcore_dll = LoadLibraryA("shcore.dll"); // Reference counted per-process
-        SetProcessDpiAwareness : (dpiContext: PROCESS_DPI_AWARENESS) -> HRESULT #foreign = xx GetProcAddress(shcore_dll, "SetProcessDpiAwareness");
+        SetProcessDpiAwareness : (dpiContext: PROCESS_DPI_AWARENESS) -> HRESULT #c_call = xx GetProcAddress(shcore_dll, "SetProcessDpiAwareness");
         if SetProcessDpiAwareness {
             SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
             return;
@@ -300,7 +300,7 @@ ImGui_ImplWin32_GetDpiScaleForMonitor :: (monitor: *void) -> float {
     if _IsWindows8Point1OrGreater() {
         if !shcore_dll
             shcore_dll = LoadLibraryA("shcore.dll"); // Reference counted per-process
-        GetDpiForMonitor: (monitor: HMONITOR, dpiType: MONITOR_DPI_TYPE, dpiX: *u32, dpiY: *u32) -> HRESULT #foreign = xx GetProcAddress(shcore_dll, "GetDpiForMonitor");
+        GetDpiForMonitor: (monitor: HMONITOR, dpiType: MONITOR_DPI_TYPE, dpiX: *u32, dpiY: *u32) -> HRESULT #c_call = xx GetProcAddress(shcore_dll, "GetDpiForMonitor");
         if GetDpiForMonitor {
             GetDpiForMonitor(cast(HMONITOR)monitor, MDT_EFFECTIVE_DPI, *xdpi, *ydpi);
             assert(xdpi == ydpi, "Please contact me if you hit this assert!");
@@ -748,7 +748,7 @@ ImGui_ImplWin32_UpdateMonitors :: () {
 // NOTE(Steven): In the C++ code, this was a static variable inside the below
 // function, since we dont have that, it is easier to make this a global variable
 // and just not use it anywhere but the below function
-RtlVerifyVersionInfo : (os_version_info: *OSVERSIONINFOEXW, version: s32, mask: u64) -> s32 #foreign;
+RtlVerifyVersionInfo : (os_version_info: *OSVERSIONINFOEXW, version: s32, mask: u64) -> s32 #c_call;
 _IsWindowsVersionOrGreater :: (major: WORD, minor: WORD, patch: WORD) -> BOOL {
     utf16_dll_name: *u16;
 
